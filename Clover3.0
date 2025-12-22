@@ -1,0 +1,299 @@
+#!/usr/bin/env python3
+import rospy
+import cv2
+import numpy as np
+import math
+import json
+from std_msgs.msg import String, ColorRGBA
+from sensor_msgs.msg import Image, CameraInfo
+from cv_bridge import CvBridge
+from clover import srv
+from std_srvs.srv import Trigger
+from pyzbar import pyzbar
+
+# ========================
+# МОДУЛЬ: Детектор цветов + настройка LED
+# ========================
+class ColorDetector:
+    def __init__(self):
+        # Диапазоны HSV для детекции
+        self.color_ranges = {
+            'red': [
+                [(0, 150, 100), (15, 255, 255)],
+                [(160, 150, 100), (180, 255, 255)]
+            ],
+            'green': [(40, 70, 70), (80, 255, 255)],
+            'blue': [(100, 150, 70), (140, 255, 255)],
+            'yellow': [(20, 100, 100), (40, 255, 255)],
+        }
+
+        # Цвета для отрисовки на изображении (BGR)
+        self.display_colors = {
+            'red': (0, 0, 255),
+            'green': (0, 255, 0),
+            'blue': (255, 0, 0),
+            'yellow': (0, 255, 255)
+        }
+
+        # === НАСТРОЙКА ЦВЕТОВ СВЕТОДИОДОВ ===
+        # Формат: (R, G, B) — значения от 0.0 до 1.0
+        # Пример: (1.0, 0.0, 0.0) = красный, (0.0, 1.0, 0.0) = зелёный
+        self.led_color_map = {
+            'red':    (1.0, 0.0, 0.5),   # розовый
+            'green':  (0.0, 1.0, 0.5),   # бирюзовый
+            'blue':   (0.5, 0.0, 1.0),   # фиолетовый
+            'yellow': (1.0, 0.8, 0.0),   # золотой
+        }
+        # ↑↑↑ ЭТО МЕСТО, ГДЕ МЕНЯТЬ ЦВЕТ СВЕТОДИОДОВ! ↑↑↑
+
+    def detect(self, img):
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        detected = []
+        for color_name, ranges in self.color_ranges.items():
+            if color_name == 'red':
+                mask1 = cv2.inRange(hsv, np.array(ranges[0][0]), np.array(ranges[0][1]))
+                mask2 = cv2.inRange(hsv, np.array(ranges[1][0]), np.array(ranges[1][1]))
+                mask = cv2.bitwise_or(mask1, mask2)
+            else:
+                mask = cv2.inRange(hsv, np.array(ranges[0]), np.array(ranges[1]))
+            
+            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            for cnt in contours:
+                if cv2.contourArea(cnt) > 300:
+                    detected.append(color_name)
+                    x, y, w, h = cv2.boundingRect(cnt)
+                    cv2.rectangle(img, (x, y), (x + w, y + h), self.display_colors[color_name], 2)
+                    cv2.putText(img, color_name, (x, y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                                self.display_colors[color_name], 2)
+        return detected
+
+
+# ========================
+# МОДУЛЬ: Детектор QR-кодов
+# ========================
+class QRCodeDetector:
+    def __init__(self):
+        self.last_text = None
+
+    def detect(self, img):
+        decoded = pyzbar.decode(img)
+        qr_codes = []
+        for obj in decoded:
+            text = obj.data.decode('utf-8')
+            qr_codes.append(text)
+            x, y, w, h = obj.rect
+            cv2.rectangle(img, (x, y), (x + w, y + h), (0, 255, 0), 2)
+            cv2.putText(img, text, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+            if text != self.last_text:
+                rospy.loginfo(f"QR Code detected: {text}")
+                self.last_text = text
+        return qr_codes
+
+
+# ========================
+# МОДУЛЬ: Отслеживание ArUco
+# ========================
+class ArucoTracker:
+    def __init__(self, target_marker_id=None):
+        self.aruco_dict = cv2.aruco.Dictionary_get(cv2.aruco.DICT_4X4_100)
+        self.aruco_params = cv2.aruco.DetectorParameters_create()
+        self.set_target(target_marker_id)
+
+    def set_target(self, marker_id):
+        self.target_id = marker_id
+        self.detected = False
+
+    def detect(self, img):
+        corners, ids, _ = cv2.aruco.detectMarkers(img, self.aruco_dict, parameters=self.aruco_params)
+        if ids is not None:
+            cv2.aruco.drawDetectedMarkers(img, corners, ids)
+            if self.target_id is not None and self.target_id in ids:
+                self.detected = True
+        else:
+            self.detected = False
+        return ids is not None
+
+
+# ========================
+# МОДУЛЬ: Обработка изображений
+# ========================
+class ImageProcessor:
+    def __init__(self):
+        self.bridge = CvBridge()
+        self.color_detector = ColorDetector()
+        self.qr_detector = QRCodeDetector()
+        self.aruco_tracker = ArucoTracker()
+
+        self.image_pub = rospy.Publisher('/processed_image', Image, queue_size=1)
+        self.debug_pub = rospy.Publisher('/detection_debug', String, queue_size=1)
+        self.led_pub = rospy.Publisher('/leds', ColorRGBA, queue_size=1)
+
+        # Сервис для получения координат
+        self.get_telemetry = rospy.ServiceProxy('get_telemetry', srv.GetTelemetry)
+
+        self._last_colors = []
+        self._last_qr = []
+        self._lock = False
+
+    def set_target_marker(self, marker_id):
+        self.aruco_tracker.set_target(marker_id)
+
+    def activate_led_for_color(self, color_name):
+        if color_name not in self.color_detector.led_color_map:
+            return
+        r, g, b = self.color_detector.led_color_map[color_name]
+        led_msg = ColorRGBA(r=r, g=g, b=b, a=1.0)
+        self.led_pub.publish(led_msg)
+
+        # Получаем координаты в системе 'map'
+        try:
+            telem = self.get_telemetry(frame_id='map')
+            rospy.loginfo(
+                f"✅ Detected color: '{color_name}' at position "
+                f"(x={telem.x:.2f}, y={telem.y:.2f}, z={telem.z:.2f})"
+            )
+        except rospy.ServiceException as e:
+            rospy.logwarn(f"Failed to get telemetry: {e}")
+            rospy.loginfo(f"✅ Detected color: '{color_name}' (coordinates unavailable)")
+
+    def process_image(self, cv_img):
+        if self._lock:
+            return
+        self._lock = True
+
+        img = cv_img.copy()
+        colors = self.color_detector.detect(img)
+        qr_codes = self.qr_detector.detect(img)
+        self.aruco_tracker.detect(img)
+
+        # Активируем LED для первого обнаруженного цвета
+        if colors:
+            self.activate_led_for_color(colors[0])
+
+        self._last_colors = colors[:]
+        self._last_qr = qr_codes[:]
+
+        # Публикация обработанного изображения
+        try:
+            self.image_pub.publish(self.bridge.cv2_to_imgmsg(img, "bgr8"))
+        except Exception as e:
+            rospy.logerr(f"Failed to publish image: {e}")
+
+        # Публикация отладочных данных
+        debug_data = {
+            'target_marker': self.aruco_tracker.target_id,
+            'colors': colors,
+            'qr_codes': qr_codes,
+            'marker_detected': self.aruco_tracker.detected,
+            'timestamp': rospy.get_time()
+        }
+        self.debug_pub.publish(String(data=json.dumps(debug_data)))
+
+        self._lock = False
+
+    def get_latest_detections(self):
+        return self._last_colors[:], self._last_qr[:]
+
+
+# ========================
+# МОДУЛЬ: Контроллер миссии
+# ========================
+class MissionController:
+    def __init__(self):
+        self.get_telemetry = rospy.ServiceProxy('get_telemetry', srv.GetTelemetry)
+        self.navigate = rospy.ServiceProxy('navigate', srv.Navigate)
+        self.land = rospy.ServiceProxy('land', Trigger)
+        self.image_processor = ImageProcessor()
+
+        rospy.Subscriber('main_camera/image_raw', Image, self._image_callback, queue_size=1)
+
+    def _image_callback(self, msg):
+        try:
+            cv_img = self.image_processor.bridge.imgmsg_to_cv2(msg, 'bgr8')
+            self.image_processor.process_image(cv_img)
+        except Exception as e:
+            rospy.logerr(f"Image callback error: {e}")
+
+    def takeoff(self):
+        rospy.loginfo("Taking off...")
+        self.navigate(x=0, y=0, z=1.0, speed=0.5, frame_id='body', auto_arm=True)
+        rospy.sleep(5)
+
+    def land_drone(self):
+        rospy.loginfo("Landing...")
+        self.land()
+        rospy.sleep(3)
+
+    def approach_marker(self, marker_id, timeout=5.0):
+        rospy.loginfo(f"Approaching marker {marker_id}...")
+        self.image_processor.set_target_marker(marker_id)
+
+        # Ожидание появления фрейма маркера
+        marker_visible = False
+        for _ in range(10):  # ждём до 10 сек
+            try:
+                self.get_telemetry(frame_id=f'aruco_{marker_id}')
+                marker_visible = True
+                break
+            except rospy.ServiceException:
+                rospy.sleep(1.0)
+        if not marker_visible:
+            rospy.logerr(f"Marker {marker_id} never became visible.")
+            return False
+
+        # Летим к маркеру
+        self.navigate(x=0, y=0, z=0.8, speed=0.3, frame_id=f'aruco_{marker_id}')
+        rospy.sleep(1.0)
+
+        # Ждём приближения
+        start = rospy.Time.now()
+        while (rospy.Time.now() - start).to_sec() < timeout:
+            if self.image_processor.aruco_tracker.detected:
+                rospy.loginfo(f"✅ Marker {marker_id} confirmed in view.")
+                return True
+            try:
+                telem = self.get_telemetry(frame_id=f'aruco_{marker_id}')
+                dist = math.sqrt(telem.x**2 + telem.y**2 + telem.z**2)
+                if dist < 0.6:
+                    return True
+            except:
+                pass
+            rospy.sleep(0.2)
+
+        rospy.logwarn(f"Timeout while approaching marker {marker_id}")
+        return False
+
+    def run_mission(self):
+        markers = [20, 27, 37, 31, 41, 47, 57, 51, 61, 67, 77, 71, 81, 87, 97, 90]
+
+        for marker in markers:
+            if self.approach_marker(marker):
+                rospy.loginfo(f"Observing near marker {marker} for 3 seconds...")
+                rospy.sleep(3.0)
+                colors, qrs = self.image_processor.get_latest_detections()
+                if colors:
+                    rospy.loginfo(f"Colors detected during hover: {colors}")
+                if qrs:
+                    rospy.loginfo(f"QR codes read: {qrs}")
+            else:
+                rospy.logwarn(f"Skipping marker {marker}")
+
+    def start(self):
+        self.takeoff()
+        self.run_mission()
+        self.land_drone()
+
+
+# ========================
+# MAIN
+# ========================
+if __name__ == '__main__':
+    rospy.init_node('modular_aruco_color_follower')
+    rospy.loginfo("Waiting for camera info...")
+    rospy.wait_for_message('main_camera/camera_info', CameraInfo)
+    rospy.loginfo("Starting mission controller...")
+    controller = MissionController()
+    try:
+        controller.start()
+    except rospy.ROSInterruptException:
+        pass
